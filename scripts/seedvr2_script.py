@@ -3,28 +3,27 @@ import sys
 import gradio as gr
 from modules import scripts, processing, images, shared
 from modules.processing import Processed, create_infotext, StableDiffusionProcessingTxt2Img
-from modules.ui_components import FormRow
 from torchvision import transforms
 import torch
 import numpy as np
 from PIL import Image
-import random 
+import random
 
-# 引入显存管理模块
+# SD checkpoint unload, used to free VRAM before SeedVR2 loads.
 import modules.sd_models
 
-# 定义扩展根目录
 EXTENSION_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODEL_DIR = os.path.join(EXTENSION_ROOT, "models", "SeedVR2") 
+if EXTENSION_ROOT not in sys.path:
+    sys.path.insert(0, EXTENSION_ROOT)
 
-# 如果默认目录不存在，尝试查找 WebUI 主目录的 models
-if not os.path.exists(MODEL_DIR):
-    MODEL_DIR_FALLBACK = os.path.join(shared.models_path, "SeedVR2")
-    if os.path.exists(MODEL_DIR_FALLBACK):
-        MODEL_DIR = MODEL_DIR_FALLBACK
+import src.webui_diag as webui_diag
 
-# 定义一个自定义异常，用于优雅地中断 SeedVR2
+# Extension models/SeedVR2, then the WebUI models/SeedVR2 folder.
+MODEL_DIR = webui_diag.resolve_model_dir(EXTENSION_ROOT, getattr(shared, "models_path", None))
+
+
 class SeedVR2Interrupted(Exception):
+    """Raised when the user stops generation mid-upscale."""
     pass
 
 class Script(scripts.Script):
@@ -35,7 +34,10 @@ class Script(scripts.Script):
         return True
 
     def ui(self, is_img2img):
-        # --- 文件扫描 ---
+        webui_diag.collect(EXTENSION_ROOT, getattr(shared, "models_path", None))
+        webui_diag.print_once("UI status")
+        gr.Markdown(webui_diag.markdown())
+
         all_files = []
         if os.path.exists(MODEL_DIR):
             all_files = [f for f in os.listdir(MODEL_DIR) if f.endswith(".gguf") or f.endswith(".safetensors")]
@@ -61,7 +63,7 @@ class Script(scripts.Script):
             unload_sd = gr.Checkbox(label="Unload SD Checkpoint", value=True, elem_classes="force-unload")
             save_original = gr.Checkbox(label="Save Extra Copy of Original", value=False)
             force_reload = gr.Checkbox(label="Force Reload", value=False)
-            debug_mode = gr.Checkbox(label="Show Debug Logs", value=False)
+            debug_mode = gr.Checkbox(label="Show Debug Logs", value=False, info="Extra console lines while an upscale is running. Startup status is always printed.")
 
         with gr.Accordion("Advanced Settings (Noise & Tiling)", open=False):
             with gr.Row():
@@ -79,16 +81,23 @@ class Script(scripts.Script):
     def run(self, p, dit_model_name, vae_model_name, seed, resolution, input_noise, latent_noise, force_reload, unload_sd, save_original, use_tile_vae, tile_size, tile_overlap, debug_mode):
         if EXTENSION_ROOT not in sys.path:
             sys.path.insert(0, EXTENSION_ROOT)
-        
-        # --- 定义中断检查回调函数 ---
+
+        tab = "txt2img" if isinstance(p, StableDiffusionProcessingTxt2Img) else "img2img"
+        print(f"[SeedVR2] run started on {tab}. dir={MODEL_DIR} dit={dit_model_name!r} vae={vae_model_name!r} debug={bool(debug_mode)}")
+
+        if not dit_model_name or not vae_model_name:
+            message = f"[SeedVR2] missing weights. DiT={dit_model_name!r} VAE={vae_model_name!r} dir={MODEL_DIR}"
+            print(message)
+            return Processed(p, [], p.seed, message)
+
         def check_interruption(*args, **kwargs):
-            # ★★★ 修复：移除 .stopping 检查，只保留 .interrupted ★★★
+            # Only shared.state.interrupted is reliable. .stopping was removed.
             if shared.state.interrupted:
                 raise SeedVR2Interrupted("User interrupted generation.")
 
-        # --- Txt2Img 自动劫持 ---
+        # txt2img: generate the base image first, then upscale it.
         if isinstance(p, StableDiffusionProcessingTxt2Img):
-            if debug_mode: print("[SeedVR2] Generating base image (txt2img)...")
+            print("[SeedVR2] Generating base image (txt2img)...")
             
             current_script = None
             if p.scripts is not None:
@@ -105,10 +114,9 @@ class Script(scripts.Script):
                 if current_script and p.scripts:
                     p.scripts.scripts.append(current_script)
             
-            # ★★★ 修复：移除 .stopping 检查 ★★★
             if shared.state.interrupted:
-                print("[SeedVR2] Interrupted during Txt2Img generation. Stopping SeedVR2.")
-                return processed_base # 直接返回半成品
+                print("[SeedVR2] Interrupted during txt2img generation. Stopping SeedVR2.")
+                return processed_base
 
             input_img = processed_base.images[0]
             
@@ -116,20 +124,21 @@ class Script(scripts.Script):
                  images.save_image(input_img, p.outpath_samples, "", processed_base.seed, p.prompt, shared.opts.samples_format, info=processed_base.info, p=p, suffix="-original")
             
         else:
-            # Img2Img 模式
-            # ★★★ 修复：移除 .stopping 检查 ★★★
             if shared.state.interrupted:
+                 print("[SeedVR2] Interrupted before img2img upscale.")
                  return Processed(p, [], p.seed, "Interrupted")
+            if not getattr(p, "init_images", None):
+                message = "[SeedVR2] img2img has no input image."
+                print(message)
+                return Processed(p, [], p.seed, message)
             input_img = p.init_images[0]
 
-        # --- 显存清理 ---
         if unload_sd:
             if debug_mode: print("[SeedVR2] Unloading SD models...")
             modules.sd_models.unload_model_weights()
             import modules.devices as devices
             devices.torch_gc()
 
-        # --- Seed 处理 ---
         if seed == -1:
             if hasattr(p, 'all_seeds') and p.all_seeds is not None and len(p.all_seeds) > 0 and p.all_seeds[0] != -1:
                 actual_seed = int(p.all_seeds[0])
@@ -186,12 +195,11 @@ class Script(scripts.Script):
             args.compile_vae = False
 
         except ImportError as e:
+            print(f"[SeedVR2] import failed: {e}")
             return Processed(p, [], p.seed, f"Error: {e}")
 
-        # 图像预处理
         img_tensor = transforms.ToTensor()(input_img).unsqueeze(0).permute(0, 2, 3, 1).to(dtype=torch.float16)
-        
-        # 缓存管理
+
         if not hasattr(self, 'runner_cache'):
             self.runner_cache = {}
             
@@ -253,27 +261,26 @@ class Script(scripts.Script):
                 prepend_frames=0, temporal_overlap=0, debug=debug
             )
             
-            if not debug_mode: print(f"[SeedVR2] Phase 1/4: Encoding {'(Tiled)' if use_tile_vae else ''}...")
+            print(f"[SeedVR2] Phase 1/4: Encoding {'(Tiled)' if use_tile_vae else ''}...")
             ctx = encode_all_batches(runner, ctx=ctx, images=frames_tensor, debug=debug, batch_size=1, uniform_batch_size=False, seed=args.seed, 
                                      progress_callback=check_interruption, 
                                      temporal_overlap=0, resolution=args.resolution, max_resolution=0, input_noise_scale=args.input_noise_scale, color_correction="lab")
             
-            if not debug_mode: print("[SeedVR2] Phase 2/4: Upscaling...")
+            print("[SeedVR2] Phase 2/4: Upscaling...")
             ctx = upscale_all_batches(runner, ctx=ctx, debug=debug, 
                                       progress_callback=check_interruption, 
                                       seed=args.seed, latent_noise_scale=args.latent_noise_scale, cache_model=True)
             
-            if not debug_mode: print(f"[SeedVR2] Phase 3/4: Decoding {'(Tiled)' if use_tile_vae else ''}...")
+            print(f"[SeedVR2] Phase 3/4: Decoding {'(Tiled)' if use_tile_vae else ''}...")
             ctx = decode_all_batches(runner, ctx=ctx, debug=debug, 
                                      progress_callback=check_interruption, 
                                      cache_model=True)
             
-            if not debug_mode: print("[SeedVR2] Phase 4/4: Post-processing...")
+            print("[SeedVR2] Phase 4/4: Post-processing...")
             ctx = postprocess_all_batches(ctx=ctx, debug=debug, 
                                           progress_callback=check_interruption, 
                                           color_correction="lab", prepend_frames=0, temporal_overlap=0, batch_size=1)
 
-            # 输出转换
             output_tensor = ctx['final_video']
             tensor_f32 = output_tensor[0].cpu().to(dtype=torch.float32)
             tensor_f32 = torch.clamp(tensor_f32, 0, 1)
@@ -281,7 +288,6 @@ class Script(scripts.Script):
             out_np = (tensor_f32.numpy() * 255.0).astype(np.uint8)
             out_pil = Image.fromarray(out_np)
 
-            # 保存
             p.extra_generation_params["SeedVR2 Model"] = dit_model_name
             p.extra_generation_params["SeedVR2 Resolution"] = resolution
             
@@ -302,7 +308,7 @@ class Script(scripts.Script):
                 suffix="-seedvr2"
             )
 
-            if not debug_mode: print("[SeedVR2] Done.")
+            print("[SeedVR2] Done.")
             return Processed(p, [out_pil], args.seed, f"SeedVR2 Upscaled")
 
         except SeedVR2Interrupted:
@@ -319,3 +325,7 @@ class Script(scripts.Script):
             if ctx is not None:
                 for k in ['images', 'encoded_latents', 'upscaled_latents', 'final_video']:
                     if k in ctx: del ctx[k]
+
+
+webui_diag.mark_script_loaded()
+print(f"[SeedVR2] upscaler script imported. model dir={MODEL_DIR}")
