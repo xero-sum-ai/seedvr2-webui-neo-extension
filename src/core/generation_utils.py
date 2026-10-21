@@ -44,6 +44,16 @@ from ..utils.constants import get_script_directory
 script_directory = get_script_directory()
 
 
+def _torch_load(path, **kwargs):
+    """torch.load that works on both old and new PyTorch.
+    Uses weights_only=True when the installed PyTorch supports it.
+    """
+    try:
+        return torch.load(path, weights_only=True, **kwargs)
+    except TypeError:
+        # PyTorch < 1.13 doesn't have weights_only
+        return torch.load(path, **kwargs)
+
 def prepare_video_transforms(resolution: int, max_resolution: int = 0, debug: Optional['Debug'] = None) -> Compose:
     """
     Prepare optimized video transformation pipeline
@@ -534,8 +544,8 @@ def load_text_embeddings(script_directory: str, device: torch.device,
         - Memory-efficient embedding preparation
         - Consistent movement logging
     """
-    text_pos_embeds = torch.load(os.path.join(script_directory, 'pos_emb.pt'), weights_only=True)
-    text_neg_embeds = torch.load(os.path.join(script_directory, 'neg_emb.pt'), weights_only=True)
+    text_pos_embeds = _torch_load(os.path.join(script_directory, 'pos_emb.pt'))
+    text_neg_embeds = _torch_load(os.path.join(script_directory, 'neg_emb.pt'))
     
     text_pos_embeds = manage_tensor(
         tensor=text_pos_embeds,
